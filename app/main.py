@@ -6,9 +6,10 @@
 """
 from __future__ import annotations
 
-from bisect import bisect_right
+from array import array
+from bisect import bisect_left, bisect_right
 from fractions import Fraction
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -57,6 +58,33 @@ class CalibratedSegment(BaseModel):
 
 class CalibrateResponse(BaseModel):
     segments: List[CalibratedSegment]
+
+
+class SubtitleLine(BaseModel):
+    """一条字幕：起始时间（整数毫秒）与文字。"""
+
+    start: int = Field(..., description="片段起始时间（毫秒）")
+    text: str = Field("", description="字幕文字")
+
+
+class SuggestAnchorsRequest(BaseModel):
+    original: List[SubtitleLine] = Field(
+        ..., description="原片字幕序列，start 必须严格递增"
+    )
+    final: List[SubtitleLine] = Field(
+        ..., description="成片字幕序列，start 必须严格递增"
+    )
+
+
+class SuggestedAnchor(Anchor):
+    """一组由字幕匹配得到的同步锚点，并附来源下标。"""
+
+    original_index: int = Field(..., description="原片字幕下标（从 0 开始）")
+    final_index: int = Field(..., description="成片字幕下标（从 0 开始）")
+
+
+class AnchorSuggestResponse(BaseModel):
+    anchors: List[SuggestedAnchor]
 
 
 class ErrorItem(BaseModel):
@@ -229,6 +257,177 @@ def calibrate(req: CalibrateRequest) -> tuple[Optional[CalibrateResponse], List[
 
 
 # --------------------------------------------------------------------------- #
+# 锚点自动建议
+# --------------------------------------------------------------------------- #
+def normalize_text(text: str) -> str:
+    """去首尾空白，并把连续空白（含制表/换行）统一为单个空格。"""
+    return " ".join(text.split())
+
+
+def validate_subtitle_track(
+    lines: List[SubtitleLine], track: str
+) -> List[ErrorItem]:
+    """校验单条字幕轨道：start 非负且严格递增、文字去空白后非空。"""
+    errors: List[ErrorItem] = []
+    for i, line in enumerate(lines):
+        if line.start < 0:
+            errors.append(
+                ErrorItem(
+                    location=f"{track}.start",
+                    index=i,
+                    code="negative_time",
+                    message=f"{track} 轨道第 {i} 条 start 为负：{line.start}",
+                )
+            )
+        if i > 0 and line.start <= lines[i - 1].start:
+            errors.append(
+                ErrorItem(
+                    location=f"{track}.start",
+                    index=i,
+                    code="not_strictly_increasing",
+                    message=(
+                        f"{track} 轨道 start 未严格递增：第 {i} 条为 {line.start}，"
+                        f"前一条为 {lines[i - 1].start}"
+                    ),
+                )
+            )
+        if not normalize_text(line.text):
+            errors.append(
+                ErrorItem(
+                    location=f"{track}.text",
+                    index=i,
+                    code="empty_text",
+                    message=f"{track} 轨道第 {i} 条 text 去空白后为空",
+                )
+            )
+    return errors
+
+
+def _better(c: int, d: int, c2: int, d2: int) -> bool:
+    """先比匹配数（多者优），再比序号差绝对值之和（少者优）。"""
+    return c > c2 or (c == c2 and d < d2)
+
+
+def _build_match_dp(
+    a: List[str], b: List[str]
+) -> Tuple[List[array], List[array]]:
+    """后缀 LCS 动态规划。
+
+    cnt[i][j]：仅使用 a[i:] 与 b[j:] 时的最大匹配数；
+    dst[i][j]：达到该匹配数的前提下，最小的配对序号差绝对值之和。
+    匹配仅允许发生在规范化后文字完全相等的条目之间，允许跳过任意片段。
+    """
+    n, m = len(a), len(b)
+    cnt: List[array] = [array("i", [0]) * (m + 1) for _ in range(n + 1)]
+    dst: List[array] = [array("i", [0]) * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        row_c, row_d = cnt[i], dst[i]
+        down_c, down_d = cnt[i + 1], dst[i + 1]
+        for j in range(m - 1, -1, -1):
+            # 跳过 a[i] 或跳过 b[j]
+            best_c, best_d = down_c[j], down_d[j]
+            if _better(row_c[j + 1], row_d[j + 1], best_c, best_d):
+                best_c, best_d = row_c[j + 1], row_d[j + 1]
+            # 配对 a[i] 与 b[j]
+            if a[i] == b[j]:
+                mc = 1 + down_c[j + 1]
+                md = abs(i - j) + down_d[j + 1]
+                if _better(mc, md, best_c, best_d):
+                    best_c, best_d = mc, md
+            row_c[j], row_d[j] = best_c, best_d
+    return cnt, dst
+
+
+def _reconstruct_pairs(
+    a: List[str],
+    b: List[str],
+    cnt: List[array],
+    dst: List[array],
+) -> List[Tuple[int, int]]:
+    """在匹配数与序号差之和均最优的解中，取配对序号序列字典序最小者。
+
+    每个状态按 (p, q) 字典序扫描可配的文字相等条目，选第一个与后缀
+    DP 完全吻合的；相等时配对产生的首对序号一定不晚于任何跳过方案，
+    因此字典序最优解必然包含该对，可贪心前移。
+    """
+    # 成片中每种规范化文字出现的下标（有序），支持快速枚举候选配对
+    positions: Dict[str, List[int]] = {}
+    for j, text in enumerate(b):
+        positions.setdefault(text, []).append(j)
+
+    pairs: List[Tuple[int, int]] = []
+    i, j = 0, 0
+    n, m = len(a), len(b)
+    while i < n and j < m:
+        total_c, total_d = cnt[i][j], dst[i][j]
+        if total_c == 0:
+            break
+        chosen: Optional[Tuple[int, int]] = None
+        for p in range(i, n):
+            found = None
+            occ = positions.get(a[p])
+            if occ:
+                # 下标升序，同一 p 下按 q 字典序；失败的候选不会再被后续状态访问
+                for q in occ[bisect_left(occ, j):]:
+                    if (
+                        1 + cnt[p + 1][q + 1] == total_c
+                        and abs(p - q) + dst[p + 1][q + 1] == total_d
+                    ):
+                        found = (p, q)
+                        break
+            if found is not None:
+                chosen = found
+                break
+        if chosen is None:  # 理论上不可达：DP 已证明存在最优解
+            break
+        pairs.append(chosen)
+        i, j = chosen[0] + 1, chosen[1] + 1
+    return pairs
+
+
+def suggest_anchors(
+    req: SuggestAnchorsRequest,
+) -> Tuple[Optional[AnchorSuggestResponse], List[ErrorItem]]:
+    """根据两条字幕序列的文字匹配，全局最优地推导同步锚点。"""
+    errors = validate_subtitle_track(req.original, "original")
+    errors += validate_subtitle_track(req.final, "final")
+    if errors:
+        return None, errors
+
+    a = [normalize_text(line.text) for line in req.original]
+    b = [normalize_text(line.text) for line in req.final]
+    cnt, dst = _build_match_dp(a, b)
+
+    if cnt[0][0] < 2:
+        return None, [
+            ErrorItem(
+                location="anchors",
+                index=None,
+                code="not_enough_matches",
+                message=(
+                    f"可用匹配仅 {cnt[0][0]} 对，至少需要 2 对才能生成同步锚点"
+                ),
+            )
+        ]
+
+    pairs = _reconstruct_pairs(a, b, cnt, dst)
+    return (
+        AnchorSuggestResponse(
+            anchors=[
+                SuggestedAnchor(
+                    original=req.original[p].start,
+                    final=req.final[q].start,
+                    original_index=p,
+                    final_index=q,
+                )
+                for p, q in pairs
+            ]
+        ),
+        [],
+    )
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI
 # --------------------------------------------------------------------------- #
 app = FastAPI(
@@ -254,6 +453,20 @@ def calibrate_endpoint(req: CalibrateRequest) -> CalibrateResponse:
             status_code=422,
             content={
                 "error": "calibration_failed",
+                "detail": [e.model_dump() for e in errors],
+            },
+        )
+    return resp  # type: ignore[return-value]
+
+
+@app.post("/anchors/suggest", response_model=AnchorSuggestResponse)
+def suggest_anchors_endpoint(req: SuggestAnchorsRequest) -> AnchorSuggestResponse:
+    resp, errors = suggest_anchors(req)
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "anchor_suggestion_failed",
                 "detail": [e.model_dump() for e in errors],
             },
         )
